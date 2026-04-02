@@ -149,10 +149,68 @@ final class DaemonManager {
         return "\(home)/.token-remote/daemon"
     }
 
+    // MARK: - Existing process detection
+
+    /// Check if daemon is already running (e.g. launched from terminal or a previous app instance).
+    /// Returns the PID if found, nil otherwise.
+    private func findExistingDaemonPID() -> Int32? {
+        let pgrep = Process()
+        let pipe = Pipe()
+        pgrep.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+        pgrep.arguments = ["-f", "token-remote/daemon/index.mjs"]
+        pgrep.standardOutput = pipe
+        pgrep.standardError = FileHandle.nullDevice
+        try? pgrep.run()
+        pgrep.waitUntilExit()
+
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        guard let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !output.isEmpty else { return nil }
+
+        // May return multiple PIDs — take the first one
+        let pids = output.split(separator: "\n").compactMap { Int32($0.trimmingCharacters(in: .whitespaces)) }
+        return pids.first
+    }
+
+    /// PID of an externally-started daemon we adopted (not our child process)
+    private var adoptedPID: Int32?
+
+    /// Adopt an already-running daemon: mark state as running, monitor its lifetime.
+    private func adoptExistingDaemon(pid: Int32) {
+        logger.info("Found existing daemon (pid \(pid)) — adopting instead of spawning a new one")
+        adoptedPID = pid
+        state = .running
+        startedAt = Date()
+        lastHealthyAt = Date()
+        lastError = nil
+
+        // Monitor the external process by polling (kill -0 checks existence without signaling)
+        Task { @MainActor in
+            while self.state == .running {
+                try? await Task.sleep(for: .seconds(5))
+                let alive = kill(pid, 0) == 0
+                if !alive {
+                    logger.info("Adopted daemon (pid \(pid)) exited — will restart")
+                    self.adoptedPID = nil
+                    self.startedAt = nil
+                    self.handleTermination(exitCode: 1)
+                    break
+                }
+                self.uptimeTick += 1
+            }
+        }
+    }
+
     // MARK: - Lifecycle
 
     func start() {
         guard state != .running && state != .starting else { return }
+
+        // Check for an existing daemon before spawning a new one
+        if let existingPID = findExistingDaemonPID() {
+            adoptExistingDaemon(pid: existingPID)
+            return
+        }
 
         guard let nodePath = resolveNodePath() else {
             lastError = "Node.js not found. Install from nodejs.org"
@@ -289,6 +347,7 @@ final class DaemonManager {
         killProcess()
         state = .stopped
         startedAt = nil
+        adoptedPID = nil
         autoRestart = true // re-enable for next manual start
     }
 
@@ -297,10 +356,18 @@ final class DaemonManager {
         killProcess()
         backoffSeconds = 2
         restartCount += 1
+        adoptedPID = nil
         start()
     }
 
     private func killProcess() {
+        // Kill adopted external process
+        if let pid = adoptedPID {
+            kill(pid, SIGTERM)
+            adoptedPID = nil
+            // No need to wait — the monitor task will notice it's gone
+        }
+        // Kill our own child process
         guard let proc = process, proc.isRunning else { return }
         proc.terminate()
         // Give it 3 seconds to shutdown gracefully, then force kill
