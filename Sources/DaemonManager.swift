@@ -35,9 +35,15 @@ final class DaemonManager {
     // Uptime refresh
     var uptimeTick: Int = 0
 
-    // Login Item
+    // Login Item — cached to avoid TCC blocking on main thread
+    private var _launchAtLoginCached: Bool?
     var launchAtLogin: Bool {
-        get { SMAppService.mainApp.status == .enabled }
+        get {
+            if let cached = _launchAtLoginCached { return cached }
+            let status = SMAppService.mainApp.status == .enabled
+            _launchAtLoginCached = status
+            return status
+        }
         set {
             do {
                 if newValue {
@@ -45,6 +51,7 @@ final class DaemonManager {
                 } else {
                     try SMAppService.mainApp.unregister()
                 }
+                _launchAtLoginCached = newValue
                 logger.info("Launch at login: \(newValue)")
             } catch {
                 logger.error("Failed to set launch at login: \(error.localizedDescription)")
@@ -53,13 +60,14 @@ final class DaemonManager {
     }
 
     init() {
-        // Schedule auto-start after a brief delay to let SwiftUI finish setup
-        Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(500))
-            if self.autoStartOnInit && self.state == .stopped {
-                self.start()
-            }
+        // Launch daemon from a background thread to avoid blocking during SwiftUI setup.
+        // Process.run() does not require the main thread.
+        let script = daemonScript
+        let dir = daemonDir
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 1) { [weak self] in
+            self?.launchDaemonFromBackground(script: script, dir: dir)
         }
+
         // Uptime refresh timer
         Task { @MainActor in
             while !Task.isCancelled {
@@ -109,10 +117,13 @@ final class DaemonManager {
     private var lastHealthyAt: Date?
     private var autoRestart = true
     private let maxBackoff: TimeInterval = 60
-    private let healthyThreshold: TimeInterval = 300 // 5 min before backoff resets
+    private let healthyResetThreshold: TimeInterval = 30
 
-    // MARK: - Node resolution
-    private func resolveNodePath() -> String? {
+    /// PID of an externally-started daemon we adopted (not our child process)
+    private var adoptedPID: Int32?
+
+    // MARK: - Node resolution (nonisolated — safe to call from any thread)
+    private nonisolated func resolveNodePath() -> String? {
         let candidates = [
             "/usr/local/bin/node",
             "/opt/homebrew/bin/node",
@@ -122,7 +133,6 @@ final class DaemonManager {
                 return path
             }
         }
-        // Try `which node` as fallback
         let which = Process()
         let pipe = Pipe()
         which.executableURL = URL(fileURLWithPath: "/usr/bin/which")
@@ -139,25 +149,24 @@ final class DaemonManager {
         return nil
     }
 
-    private var daemonScript: String {
+    private nonisolated var daemonScript: String {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         return "\(home)/.token-remote/daemon/index.mjs"
     }
 
-    private var daemonDir: String {
+    private nonisolated var daemonDir: String {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         return "\(home)/.token-remote/daemon"
     }
 
-    // MARK: - Existing process detection
+    // MARK: - Existing process detection (nonisolated)
 
-    /// Check if daemon is already running (e.g. launched from terminal or a previous app instance).
-    /// Returns the PID if found, nil otherwise.
-    private func findExistingDaemonPID() -> Int32? {
+    private nonisolated func findExistingDaemonPID() -> Int32? {
         let pgrep = Process()
         let pipe = Pipe()
         pgrep.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
-        pgrep.arguments = ["-f", "token-remote/daemon/index.mjs"]
+        // Match only node processes running the daemon script (excludes shell/grep matches)
+        pgrep.arguments = ["-f", "node.*token-remote/daemon/index.mjs"]
         pgrep.standardOutput = pipe
         pgrep.standardError = FileHandle.nullDevice
         try? pgrep.run()
@@ -166,31 +175,141 @@ final class DaemonManager {
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         guard let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
               !output.isEmpty else { return nil }
-
-        // May return multiple PIDs — take the first one
-        let pids = output.split(separator: "\n").compactMap { Int32($0.trimmingCharacters(in: .whitespaces)) }
-        return pids.first
+        return output.split(separator: "\n").compactMap { Int32($0.trimmingCharacters(in: .whitespaces)) }.first
     }
 
-    /// PID of an externally-started daemon we adopted (not our child process)
-    private var adoptedPID: Int32?
+    // MARK: - Background launch (called from GCD, not main actor)
 
-    /// Adopt an already-running daemon: mark state as running, monitor its lifetime.
+    /// Launches the daemon process entirely from a background thread.
+    /// Only touches MainActor for state updates via Task{}.
+    private nonisolated func launchDaemonFromBackground(script: String, dir: String) {
+        // Check for existing daemon
+        if let pid = findExistingDaemonPID() {
+            Task { @MainActor [weak self] in self?.adoptExistingDaemon(pid: pid) }
+            return
+        }
+
+        guard let nodePath = resolveNodePath() else {
+            Task { @MainActor [weak self] in
+                self?.lastError = "Node.js not found. Install from nodejs.org"
+                self?.state = .crashed
+            }
+            return
+        }
+
+        guard FileManager.default.fileExists(atPath: script) else {
+            Task { @MainActor [weak self] in
+                self?.lastError = "Daemon script not found"
+                self?.state = .crashed
+            }
+            return
+        }
+
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: nodePath)
+        proc.arguments = [script]
+        proc.currentDirectoryURL = URL(fileURLWithPath: dir)
+
+        var env = ProcessInfo.processInfo.environment
+        env["FORCE_COLOR"] = "0"
+        env["NO_COLOR"] = "1"
+        proc.environment = env
+
+        let stdout = Pipe()
+        let stderr = Pipe()
+        proc.standardOutput = stdout
+        proc.standardError = stderr
+
+        // Termination handler (runs on arbitrary thread)
+        proc.terminationHandler = { [weak self] p in
+            let code = p.terminationStatus
+            Task { @MainActor in self?.handleTermination(exitCode: code) }
+        }
+
+        // Pipe handlers (run on arbitrary thread, dispatch to MainActor)
+        stdout.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+            let lines = text.split(separator: "\n", omittingEmptySubsequences: true)
+            let parsedLines = lines.map { String($0.prefix(200)) }
+            let isHealthy = lines.contains { $0.contains("poll loop") || $0.contains("Device registered") }
+
+            var taskCommand: String?
+            var taskCompleted = false
+            var pollErrorCount = 0
+            for line in lines {
+                if line.contains("Running task") || line.contains("Sending instruction"),
+                   let r = line.range(of: ": ", options: .backwards) {
+                    taskCommand = String(line[r.upperBound...].prefix(100))
+                }
+                if line.contains("Task") && line.contains("complete") { taskCompleted = true }
+                if line.contains("Poll error") { pollErrorCount += 1 }
+            }
+
+            Task { @MainActor in
+                guard let self else { return }
+                self.lastLogLine = parsedLines.last
+                for line in parsedLines { self.recentLogs.append(line) }
+                while self.recentLogs.count > self.maxRecentLogs { self.recentLogs.removeFirst() }
+                if isHealthy {
+                    self.state = .running
+                    self.startedAt = self.startedAt ?? Date()
+                    self.lastHealthyAt = Date()
+                }
+                if let cmd = taskCommand { self.lastTaskCommand = cmd; self.lastTaskAt = Date() }
+                if taskCompleted { self.tasksCompleted += 1 }
+                self.pollErrors += pollErrorCount
+            }
+        }
+
+        stderr.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+            let errorText = String(text.trimmingCharacters(in: .whitespacesAndNewlines).prefix(500))
+            Task { @MainActor in self?.lastError = errorText }
+        }
+
+        do {
+            try proc.run()
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.process = proc
+                self.stdoutPipe = stdout
+                self.stderrPipe = stderr
+                self.state = .starting
+                self.startedAt = Date()
+                // Mark running after a moment
+                Task { @MainActor in
+                    try? await Task.sleep(for: .seconds(3))
+                    if self.state == .starting {
+                        self.state = .running
+                        self.lastHealthyAt = Date()
+                    }
+                }
+            }
+        } catch {
+            Task { @MainActor [weak self] in
+                self?.state = .crashed
+                self?.lastError = error.localizedDescription
+            }
+        }
+    }
+
+    // MARK: - Adopt existing daemon
+
     private func adoptExistingDaemon(pid: Int32) {
-        logger.info("Found existing daemon (pid \(pid)) — adopting instead of spawning a new one")
         adoptedPID = pid
         state = .running
         startedAt = Date()
         lastHealthyAt = Date()
         lastError = nil
 
-        // Monitor the external process by polling (kill -0 checks existence without signaling)
         Task { @MainActor in
             while self.state == .running {
                 try? await Task.sleep(for: .seconds(5))
                 let alive = kill(pid, 0) == 0
                 if !alive {
-                    logger.info("Adopted daemon (pid \(pid)) exited — will restart")
                     self.adoptedPID = nil
                     self.startedAt = nil
                     self.handleTermination(exitCode: 1)
@@ -206,139 +325,20 @@ final class DaemonManager {
     func start() {
         guard state != .running && state != .starting else { return }
 
-        // Check for an existing daemon before spawning a new one
+        // Check for an existing daemon before spawning
         if let existingPID = findExistingDaemonPID() {
             adoptExistingDaemon(pid: existingPID)
             return
         }
 
-        guard let nodePath = resolveNodePath() else {
-            lastError = "Node.js not found. Install from nodejs.org"
-            state = .crashed
-            logger.error("Node binary not found")
-            return
-        }
-
-        guard FileManager.default.fileExists(atPath: daemonScript) else {
-            lastError = "Daemon script not found at \(daemonScript)"
-            state = .crashed
-            logger.error("Daemon script missing: \(self.daemonScript)")
-            return
-        }
-
+        let script = daemonScript
+        let dir = daemonDir
         state = .starting
         lastError = nil
-        logger.info("Starting daemon: \(nodePath) \(self.daemonScript)")
 
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: nodePath)
-        proc.arguments = [daemonScript]
-        proc.currentDirectoryURL = URL(fileURLWithPath: daemonDir)
-
-        // Pass through environment so .env loaded by dotenv works
-        var env = ProcessInfo.processInfo.environment
-        env["FORCE_COLOR"] = "0"
-        env["NO_COLOR"] = "1"
-        proc.environment = env
-
-        let stdout = Pipe()
-        let stderr = Pipe()
-        proc.standardOutput = stdout
-        proc.standardError = stderr
-
-        self.stdoutPipe = stdout
-        self.stderrPipe = stderr
-        self.process = proc
-
-        // Read stdout
-        stdout.fileHandleForReading.readabilityHandler = { @Sendable [weak self] handle in
-            let data = handle.availableData
-            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-            let lines = text.split(separator: "\n", omittingEmptySubsequences: true)
-            let parsedLines = lines.map { String($0.prefix(200)) }
-            let isHealthy = lines.contains { $0.contains("poll loop") || $0.contains("Device registered") }
-
-            // Parse task activity
-            var taskCommand: String?
-            var taskCompleted = false
-            var pollErrorCount = 0
-            for line in lines {
-                if line.contains("Running task") || line.contains("Sending instruction") {
-                    // Extract command after the colon
-                    if let colonRange = line.range(of: ": ", options: .backwards) {
-                        taskCommand = String(line[colonRange.upperBound...].prefix(100))
-                    }
-                }
-                if line.contains("Task") && line.contains("complete") {
-                    taskCompleted = true
-                }
-                if line.contains("Poll error") {
-                    pollErrorCount += 1
-                }
-            }
-
-            Task { @MainActor in
-                guard let self else { return }
-                self.lastLogLine = parsedLines.last
-                for line in parsedLines {
-                    self.recentLogs.append(line)
-                }
-                while self.recentLogs.count > self.maxRecentLogs {
-                    self.recentLogs.removeFirst()
-                }
-                if isHealthy {
-                    self.state = .running
-                    self.startedAt = self.startedAt ?? Date()
-                    self.lastHealthyAt = Date()
-                }
-                if let cmd = taskCommand {
-                    self.lastTaskCommand = cmd
-                    self.lastTaskAt = Date()
-                }
-                if taskCompleted {
-                    self.tasksCompleted += 1
-                }
-                self.pollErrors += pollErrorCount
-            }
-            logger.debug("daemon: \(text.trimmingCharacters(in: .whitespacesAndNewlines))")
-        }
-
-        // Read stderr
-        stderr.fileHandleForReading.readabilityHandler = { @Sendable [weak self] handle in
-            let data = handle.availableData
-            guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
-            let errorText = String(text.trimmingCharacters(in: .whitespacesAndNewlines).prefix(500))
-            Task { @MainActor in
-                self?.lastError = errorText
-            }
-            logger.error("daemon stderr: \(text.trimmingCharacters(in: .whitespacesAndNewlines))")
-        }
-
-        // Termination handler
-        proc.terminationHandler = { @Sendable [weak self] p in
-            let code = p.terminationStatus
-            logger.info("Daemon exited with code \(code)")
-            Task { @MainActor in
-                self?.handleTermination(exitCode: code)
-            }
-        }
-
-        do {
-            try proc.run()
-            startedAt = Date()
-            // Give it a moment, then mark running if not already
-            Task { @MainActor [weak self] in
-                try? await Task.sleep(for: .seconds(3))
-                if self?.state == .starting {
-                    self?.state = .running
-                    self?.lastHealthyAt = Date()
-                }
-            }
-            logger.info("Daemon process launched (pid \(proc.processIdentifier))")
-        } catch {
-            state = .crashed
-            lastError = error.localizedDescription
-            logger.error("Failed to launch daemon: \(error.localizedDescription)")
+        // Launch from background to avoid blocking main thread
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            self?.launchDaemonFromBackground(script: script, dir: dir)
         }
     }
 
@@ -348,7 +348,7 @@ final class DaemonManager {
         state = .stopped
         startedAt = nil
         adoptedPID = nil
-        autoRestart = true // re-enable for next manual start
+        autoRestart = true
     }
 
     func restart() {
@@ -361,20 +361,14 @@ final class DaemonManager {
     }
 
     private func killProcess() {
-        // Kill adopted external process
         if let pid = adoptedPID {
             kill(pid, SIGTERM)
             adoptedPID = nil
-            // No need to wait — the monitor task will notice it's gone
         }
-        // Kill our own child process
         guard let proc = process, proc.isRunning else { return }
         proc.terminate()
-        // Give it 3 seconds to shutdown gracefully, then force kill
         DispatchQueue.global().asyncAfter(deadline: .now() + 3) {
-            if proc.isRunning {
-                proc.interrupt() // SIGINT
-            }
+            if proc.isRunning { proc.interrupt() }
         }
         stdoutPipe?.fileHandleForReading.readabilityHandler = nil
         stderrPipe?.fileHandleForReading.readabilityHandler = nil
@@ -395,17 +389,14 @@ final class DaemonManager {
         state = .crashed
         restartCount += 1
 
-        // Reset backoff if daemon was healthy for a while
         if let healthy = lastHealthyAt,
-           Date().timeIntervalSince(healthy) > healthyThreshold {
+           Date().timeIntervalSince(healthy) > healthyResetThreshold {
             backoffSeconds = 2
         }
 
         let delay = backoffSeconds
-        logger.info("Daemon crashed (exit \(exitCode)). Restarting in \(delay)s...")
         lastError = "Exited with code \(exitCode). Restarting in \(Int(delay))s..."
-
-        backoffSeconds = min(backoffSeconds * 2, maxBackoff)
+        backoffSeconds = min(backoffSeconds * 1.5, maxBackoff)
 
         Task { @MainActor [weak self] in
             try? await Task.sleep(for: .seconds(delay))
