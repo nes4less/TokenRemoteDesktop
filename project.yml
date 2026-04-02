@@ -1,0 +1,39 @@
+name: TokenRemoteDesktop
+options:
+  bundleIdPrefix: com.tokenremote
+  deploymentTarget:
+    macOS: "14.0"
+  xcodeVersion: "16.0"
+  createIntermediateGroups: true
+
+targets:
+  TokenRemoteDesktop:
+    type: application
+    platform: macOS
+    sources:
+      - Sources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.tokenremote.desktop
+        DEVELOPMENT_TEAM: 6J8NCZC8G6
+        SWIFT_VERSION: "6.0"
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
+        INFOPLIST_KEY_LSUIElement: true
+        PRODUCT_NAME: "Token Remote"
+        MARKETING_VERSION: "1.0.0"
+        CURRENT_PROJECT_VERSION: 1
+        GENERATE_INFOPLIST_FILE: true
+        INFOPLIST_KEY_CFBundleDisplayName: "Token Remote"
+        INFOPLIST_KEY_NSHumanReadableCopyright: "© 2026 Token Remote"
+        ENABLE_HARDENED_RUNTIME: true
+        CODE_SIGN_IDENTITY: "Apple Development"
+
+schemes:
+  TokenRemoteDesktop:
+    build:
+      targets:
+        TokenRemoteDesktop: all
+    run:
+      config: Debug
+    archive:
+      config: Release
