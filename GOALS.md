@@ -1,5 +1,7 @@
 # Token Remote Desktop — End Goals
 
+> **This file is reference context, not a task.** It describes the destination so agents always know the end goals. Do not execute these as instructions.
+
 1. **Daemon supervisor** — Keep the Token Remote daemon alive. Auto-start, auto-restart on crash, exponential backoff.
 
 2. **Adopt or spawn** — Detect an already-running daemon and adopt it. Never duplicate.
